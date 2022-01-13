@@ -18,6 +18,8 @@ package podgroup
 
 import (
 	"context"
+	"strings"
+	batch "volcano.sh/apis/pkg/apis/batch/v1alpha1"
 
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -29,9 +31,14 @@ import (
 	scheduling "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 )
 
+const (
+	NormalPodGroupClean = "normalPodGroupClean"
+)
+
 type podRequest struct {
 	podName      string
 	podNamespace string
+	action       string
 }
 
 func (pg *pgcontroller) addPod(obj interface{}) {
@@ -44,6 +51,43 @@ func (pg *pgcontroller) addPod(obj interface{}) {
 	req := podRequest{
 		podName:      pod.Name,
 		podNamespace: pod.Namespace,
+	}
+
+	pg.queue.Add(req)
+}
+
+func (pg *pgcontroller) updatePod(oldObj, newObj interface{}) {
+	oldPod, ok := oldObj.(*v1.Pod)
+	if !ok {
+		klog.Errorf("Failed to convert %v to v1.Pod", oldObj)
+		return
+	}
+
+	newPod, ok := newObj.(*v1.Pod)
+	if !ok {
+		klog.Errorf("Failed to convert %v to v1.Pod", newObj)
+		return
+	}
+
+	// Filter out normal pod
+	if !isControlledBy(pg.schedulerNames, newPod) {
+		klog.Infof("Pod <%s/%s> is not controlled by normal pod", newPod.Namespace, newPod.Name)
+		return
+	}
+
+	if newPod.ResourceVersion == oldPod.ResourceVersion {
+		return
+	}
+
+	if !isFinishedPod(oldPod, newPod) {
+		klog.Infof("Pod <%s/%s> is not finished and state is: %s ", newPod.Namespace, newPod.Name, newPod.Status.Phase)
+		return
+	}
+
+	req := podRequest{
+		podName:      newPod.Name,
+		podNamespace: newPod.Namespace,
+		action:       NormalPodGroupClean,
 	}
 
 	pg.queue.Add(req)
@@ -179,4 +223,32 @@ func calcPGMinResources(pod *v1.Pod) *v1.ResourceList {
 	}
 
 	return &pgMinRes
+}
+
+func isControlledBy(schedulerNames []string, pod *v1.Pod) bool {
+	if !contains(schedulerNames, pod.Spec.SchedulerName) {
+		klog.V(5).Infof("pod %v/%v field SchedulerName is not matched", pod.Namespace, pod.Name)
+		return false
+	}
+	if pod.Annotations == nil {
+		return false
+	}
+	pgName := pod.Annotations[scheduling.KubeGroupNameAnnotationKey]
+	klog.V(6).Infof("The pod group of Pod<%s/%s> is %s,", pod.Namespace, pod.Name, pgName)
+	if strings.HasPrefix(pgName, batch.PodgroupNamePrefix) {
+		return true
+	}
+	return false
+}
+
+func isFinishedPod(oldPod, newPod *v1.Pod) bool {
+	if oldPod == nil || newPod == nil {
+		return false
+	}
+	if (oldPod.Status.Phase != newPod.Status.Phase) && (newPod.Status.Phase == v1.PodFailed ||
+		newPod.Status.Phase == v1.PodSucceeded ||
+		newPod.Status.Phase == v1.PodUnknown) {
+		return true
+	}
+	return false
 }

@@ -17,6 +17,9 @@ limitations under the License.
 package podgroup
 
 import (
+	"context"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
@@ -77,6 +80,7 @@ func (pg *pgcontroller) Initialize(opt *framework.ControllerOption) error {
 	pg.podSynced = pg.podInformer.Informer().HasSynced
 	pg.podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: pg.addPod,
+		UpdateFunc: pg.updatePod,
 	})
 
 	pg.pgInformer = informerfactory.NewSharedInformerFactory(pg.vcClient, 0).Scheduling().V1beta1().PodGroups()
@@ -124,16 +128,26 @@ func (pg *pgcontroller) processNextReq() bool {
 		return true
 	}
 
-	if pod.Annotations != nil && pod.Annotations[scheduling.KubeGroupNameAnnotationKey] != "" {
-		klog.V(5).Infof("pod %v/%v has created podgroup", pod.Namespace, pod.Name)
-		return true
-	}
-
-	// normal pod use volcano
-	if err := pg.createNormalPodPGIfNotExist(pod); err != nil {
-		klog.Errorf("Failed to handle Pod <%s/%s>: %v", pod.Namespace, pod.Name, err)
-		pg.queue.AddRateLimited(req)
-		return true
+	if req.action == NormalPodGroupClean {
+		// clean normal pod group
+		pgName := pod.Annotations[scheduling.KubeGroupNameAnnotationKey]
+		klog.Infof("Clean normal pod group<%s/%s> when pod state is: %s", pod.Namespace, pgName, pod.Status.Phase)
+		if err := pg.vcClient.SchedulingV1beta1().PodGroups(pod.Namespace).Delete(context.TODO(), pgName, metav1.DeleteOptions{}); err != nil {
+			klog.Errorf("Failed to clean normal pod group <%s/%s>", pod.Namespace, pgName)
+			pg.queue.AddRateLimited(req)
+			return true
+		}
+	} else {
+		if pod.Annotations != nil && pod.Annotations[scheduling.KubeGroupNameAnnotationKey] != "" {
+			klog.V(5).Infof("pod %v/%v has created podgroup", pod.Namespace, pod.Name)
+			return true
+		}
+		// normal pod use volcano
+		if err := pg.createNormalPodPGIfNotExist(pod); err != nil {
+			klog.Errorf("Failed to handle Pod <%s/%s>: %v", pod.Namespace, pod.Name, err)
+			pg.queue.AddRateLimited(req)
+			return true
+		}
 	}
 
 	// If no error, forget it.
